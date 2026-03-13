@@ -64,8 +64,8 @@ def _load_port_tree():
             next((c for c in wpi.columns if "LAT" in c.upper()), None),
         )
         lon_col = next(
-            (c for c in wpi.columns if "LON" in c.upper() and "DEG" not in c.upper()),
-            next((c for c in wpi.columns if "LON" in c.upper()), None),
+            (c for c in wpi.columns if "LONGI" in c.upper() and "DEG" not in c.upper()),
+            next((c for c in wpi.columns if "LONGI" in c.upper()), None),
         )
 
         if lat_col is None or lon_col is None:
