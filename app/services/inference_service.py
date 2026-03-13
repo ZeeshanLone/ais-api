@@ -1,13 +1,30 @@
+"""
+Inference service.
+
+Orchestrates the full prediction pipeline:
+    1. Store incoming AIS message
+    2. Fetch sliding window (last WINDOW_SIZE rows for this MMSI)
+    3. Delegate feature engineering to the registered pipeline
+    4. Delegate inference to the registered predictor
+    5. Store prediction
+    6. Return PredictionResponse
+
+InferenceService has no knowledge of which model is active. It looks up the
+(FeaturePipeline, BasePredictor) pair from the registry using model_type from
+the ModelBundle. Adding a new model requires zero changes here.
+"""
+
+import logging
 from typing import List
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import numpy as np
-import polars as pl
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import AISMessageDB, PredictionDB
 from app.models.model_bundle import ModelBundle
+from app.pipeline.registry import get_pipeline_pair
 from app.schemas import (
     INT_TO_LABEL,
     AISMessage,
@@ -16,55 +33,58 @@ from app.schemas import (
     PredictionResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class InferenceService:
     """
-    Service responsible for executing the full prediction pipeline.
+    Stateless service — one instance per request.
     """
 
     WINDOW_SIZE = 30
 
     def __init__(self, db: Session, model_bundle: ModelBundle):
         self.db = db
-        self.model_bundle = model_bundle
-
-    # PUBLIC ENTRYPOINT
+        self.bundle = model_bundle
 
     def predict(self, message: AISMessage) -> PredictionResponse:
         """
-        Execute the complete prediction pipeline.
+        Execute the full prediction pipeline for a single AIS message.
         """
-
-        # 1. Store AIS message
+        # 1. Persist incoming message
         self._store_message(message)
 
-        # 2. Retrieve sliding window
-        window = self._get_recent_messages(message.mmsi)
+        # 2. Build sliding window (last WINDOW_SIZE messages for this MMSI)
+        window = self._get_window(message.mmsi)
 
-        # 3. Compute raw feature dictionary
-        feature_dict = self._compute_features(window)
+        # 3. Look up the correct pipeline + predictor pair
+        pair = get_pipeline_pair(self.bundle.metadata.model_type)
 
-        # 4. Align + scale features
-        X = self._prepare_features(feature_dict)
+        # 4. Feature engineering (model-specific)
+        features = pair.pipeline.compute(window, self.bundle)
 
-        # 5. Model inference
-        probs = self._predict_probabilities(X)
+        # 5. Inference (model-specific)
+        probs = pair.predictor.predict(features, self.bundle)
 
-        # 6. Extract prediction
+        # 6. Decode result
         class_id = int(np.argmax(probs))
         confidence = float(np.max(probs))
         label = INT_TO_LABEL[class_id]
 
-        # 7. Store prediction
+        # 7. Persist prediction
         prediction_id = self._store_prediction(
-            message,
-            class_id,
-            label,
-            confidence,
-            probs,
+            message, class_id, label, confidence, probs
         )
 
-        # 8. Construct response
+        logger.debug(
+            "Prediction: mmsi=%d ts=%s label=%s confidence=%.3f",
+            message.mmsi,
+            message.timestamp,
+            label,
+            confidence,
+        )
+
+        # 8. Build response
         return PredictionResponse(
             prediction_id=prediction_id,
             timestamp=message.timestamp,
@@ -81,114 +101,52 @@ class InferenceService:
                 "ANCHORED": float(probs[3]),
             },
             model_info=ModelInfo(
-                name=self.model_bundle.metadata.name,
-                version=self.model_bundle.metadata.version,
-                type=self.model_bundle.metadata.model_type,
+                name=self.bundle.metadata.name,
+                version=self.bundle.metadata.version,
+                type=self.bundle.metadata.model_type,
             ),
         )
 
-    # STORE AIS MESSAGE
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
 
-    def _store_message(self, message: AISMessage):
-
-        db_message = AISMessageDB(
+    def _store_message(self, message: AISMessage) -> None:
+        db_msg = AISMessageDB(
             mmsi=message.mmsi,
             timestamp=message.timestamp,
             lat=message.lat,
             lon=message.lon,
             sog=message.sog,
             cog=message.cog,
-            heading=message.heading,
+            true_heading=message.true_heading,
             rot=message.rot,
             draught=message.draught,
             special_manoeuvre_indicator=message.special_manoeuvre_indicator,
+            ship_type=message.ship_type,
+            dim_bow=message.dim_bow,
+            dim_stern=message.dim_stern,
+            dim_port=message.dim_port,
+            dim_starboard=message.dim_starboard,
         )
-
-        self.db.add(db_message)
+        self.db.add(db_msg)
         self.db.commit()
 
-    # CONTEXT WINDOW
-
-    def _get_recent_messages(self, mmsi: int) -> List[AISMessageDB]:
+    def _get_window(self, mmsi: int) -> List[AISMessageDB]:
         """
-        Fetch last WINDOW_SIZE AIS messages for a vessel.
+        Fetch the last WINDOW_SIZE messages for this MMSI, sorted ascending
+        by timestamp (oldest first). This is the same ordering Phase 3 uses
+        (sort by time_epoch before rolling windows).
         """
-
         stmt = (
             select(AISMessageDB)
             .where(AISMessageDB.mmsi == mmsi)
             .order_by(AISMessageDB.timestamp.desc())
             .limit(self.WINDOW_SIZE)
         )
-
-        results = self.db.execute(stmt).scalars().all()
-
-        return list(reversed(results))
-
-    # FEATURE ENGINEERING
-
-    def _compute_features(self, window: List[AISMessageDB]) -> dict:
-        """
-        Convert sliding window into raw feature dictionary.
-
-        TODO: implement actual feature pipeline
-        """
-
-        last = window[-1]
-
-        return {
-            "sog": last.sog,
-            "cog": last.cog,
-            "rot": last.rot,
-            "heading": last.heading,
-            "draught": last.draught,
-        }
-
-    # FEATURE ALIGNMENT + SCALING
-
-    def _prepare_features(self, features: dict) -> np.ndarray:
-
-        feature_cols = self.model_bundle.feature_cols
-        scaler_cols = self.model_bundle.scaler_cols
-        medians = self.model_bundle.train_medians
-
-        df = pl.DataFrame([features])
-
-        # Ensure all model features exist
-        for col in feature_cols:
-            if col not in df.columns:
-                df = df.with_columns(pl.lit(medians.get(col, 0)).alias(col))
-
-        # Correct feature order
-        df = df.select(feature_cols)
-
-        # Fill missing values
-        fill_exprs = [
-            pl.col(col).fill_null(medians.get(col, 0)) for col in feature_cols
-        ]
-
-        df = df.with_columns(fill_exprs)
-
-        X = df.to_numpy()
-
-        if self.model_bundle.scaler is not None:
-            scaler_idx = [feature_cols.index(c) for c in scaler_cols]
-
-            X[:, scaler_idx] = self.model_bundle.scaler.transform(X[:, scaler_idx])
-
-        return X
-
-    # MODEL INFERENCE
-
-    def _predict_probabilities(self, X: np.ndarray):
-
-        model = self.model_bundle.model
-
-        probs = model.predict_proba(X)[0]
-
-        return probs
-
-    # STORE PREDICTION
+        rows = self.db.execute(stmt).scalars().all()
+        # Reverse: DB returns newest-first; pipeline expects oldest-first
+        return list(reversed(rows))
 
     def _store_prediction(
         self,
@@ -196,13 +154,11 @@ class InferenceService:
         class_id: int,
         label: str,
         confidence: float,
-        probs,
-    ):
-
+        probs: np.ndarray,
+    ) -> UUID:
         prediction_id = uuid4()
-
-        db_prediction = PredictionDB(
-            id=prediction_id,
+        db_pred = PredictionDB(
+            id=str(prediction_id),
             mmsi=message.mmsi,
             timestamp=message.timestamp,
             predicted_label=label,
@@ -212,12 +168,10 @@ class InferenceService:
             prob_docked=float(probs[1]),
             prob_drifting=float(probs[2]),
             prob_anchored=float(probs[3]),
-            model_name=self.model_bundle.metadata.name,
-            model_version=self.model_bundle.metadata.version,
-            model_type=self.model_bundle.metadata.model_type,
+            model_name=self.bundle.metadata.name,
+            model_version=self.bundle.metadata.version,
+            model_type=self.bundle.metadata.model_type,
         )
-
-        self.db.add(db_prediction)
+        self.db.add(db_pred)
         self.db.commit()
-
         return prediction_id

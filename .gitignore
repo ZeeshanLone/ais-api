@@ -11,3 +11,4 @@ wheels/
 .env
 *.env
 ais_predictions.db
+logs/
